@@ -470,7 +470,7 @@ function TabLista({ bateas, barcos, poligonos, cierres, exclusiones }) {
 }
 
 /* ── TAB PEDIDO ────────────────────────────────────────────── */
-function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas, setHistorial, pedidoActivo, setPedidoActivo }) {
+function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas, setHistorial, historial, pedidoActivo, setPedidoActivo, pushUndo, undoStack, onUndo }) {
   const [fecha, setFecha] = useState(hoy());
   const [desc, setDesc] = useState("");
 
@@ -503,16 +503,20 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
     if (!pedidoActivo) return;
     let arr = bateas.map((b) => ({ ...b }));
     const lineas = [];
-    const sirvenIds = new Set();
+    const rotaIds = new Set();
 
     pedidoActivo.asigs.forEach((a) => {
       const idx = arr.findIndex((b) => b.id === a.bateaId);
       if (idx < 0) return;
       if (a.resultado === "sirve") {
         const b = arr[idx];
-        arr[idx] = { ...b, viajesAcum: Math.max(0, b.viajesAcum - 1), rechazosAcum: 0 };
-        sirvenIds.add(a.bateaId);
+        const nuevoAcum = Math.max(0, b.viajesAcum - 1);
+        arr[idx] = { ...b, viajesAcum: nuevoAcum, rechazosAcum: 0 };
         lineas.push({ barcoNombre: a.barcoNombre, poligonoNombre: a.poligonoNombre, viajes: 1 });
+        // Rota al final SOLO si no le queda cupo acumulado pendiente.
+        // Si sirvió consumiendo cupo acumulado y aún le queda, mantiene su posición
+        // hasta agotarlo (no pierde el turno mientras recupera viajes del cierre).
+        if (nuevoAcum === 0) rotaIds.add(a.bateaId);
       } else {
         const b = arr[idx];
         let rech = b.rechazosAcum + 1;
@@ -522,10 +526,13 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
       }
     });
 
-    // Los que sirven rotan al final (preservando su orden relativo); los demás mantienen su sitio.
-    const quedan = arr.filter((b) => !sirvenIds.has(b.id));
-    const alFinal = arr.filter((b) => sirvenIds.has(b.id));
+    // Los que rotan van al final (preservando su orden relativo); los demás mantienen su sitio.
+    const quedan = arr.filter((b) => !rotaIds.has(b.id));
+    const alFinal = arr.filter((b) => rotaIds.has(b.id));
     arr = recalc([...quedan, ...alFinal]);
+
+    // Guarda el estado PREVIO para poder deshacer este pedido.
+    if (pushUndo) pushUndo({ bateas, historial, label: `${pedidoActivo.fecha} · ${lineas.length} viaje(s)` });
 
     setBateas(arr);
     setHistorial((h) => [{ id: uid(), fecha: pedidoActivo.fecha, desc: pedidoActivo.desc, lineas, ts: Date.now() }, ...h]);
@@ -546,6 +553,17 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
           </Btn>
           {!candidatos.length && (
             <div style={{ fontSize: 12, color: C.textDim, marginTop: 10, textAlign: "center" }}>No hay bateas abiertas para proponer.</div>
+          )}
+          {undoStack && undoStack.length > 0 && (
+            <>
+              <div style={{ borderTop: `1px solid ${C.border}`, margin: "16px 0 12px" }} />
+              <Btn outline color={C.orange} onClick={onUndo} style={{ width: "100%" }}>
+                ↩ Deshacer último pedido ({undoStack[undoStack.length - 1].label})
+              </Btn>
+              <div style={{ fontSize: 11, color: C.textDim, marginTop: 8, textAlign: "center" }}>
+                Revierte la lista y el historial al estado anterior. {undoStack.length} paso(s) disponible(s).
+              </div>
+            </>
           )}
         </Card>
       </div>
@@ -1304,6 +1322,7 @@ export default function App() {
   const [historial, setHistorial] = useState([]);
   const [pedidoActivo, setPedidoActivo] = useState(null);
   const [oficinistaPass, setOficinistaPass] = useState("admin");
+  const [undoStack, setUndoStack] = useState([]); // snapshots previos a cada pedido (sesión)
   const [tab, setTab] = useState("lista");
   const [role, setRole] = useState(null);
   const [patronBarcoId, setPatronBarcoId] = useState(null);
@@ -1333,6 +1352,16 @@ export default function App() {
       localStorage.setItem("fabrica-state", JSON.stringify({ poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass }));
     } catch (_) {}
   }, [poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass, loaded]);
+
+  /* Deshacer: guarda estado previo a cada pedido y permite revertir (hasta 10 pasos) */
+  const pushUndo = (snap) => setUndoStack((s) => [...s, snap].slice(-10));
+  const undoLast = () => {
+    if (!undoStack.length) return;
+    const last = undoStack[undoStack.length - 1];
+    setBateas(last.bateas);
+    setHistorial(last.historial);
+    setUndoStack((s) => s.slice(0, -1));
+  };
 
   if (!loaded) {
     return (
@@ -1408,7 +1437,7 @@ export default function App() {
 
         <main style={{ maxWidth: 960, margin: "0 auto", padding: "28px 24px" }}>
           {tab === "lista" && <TabLista bateas={bateas} barcos={barcos} poligonos={poligonos} cierres={cierres} exclusiones={exclusiones} />}
-          {tab === "pedido" && <TabPedido bateas={bateas} barcos={barcos} poligonos={poligonos} cierres={cierres} exclusiones={exclusiones} setBateas={setBateas} setHistorial={setHistorial} pedidoActivo={pedidoActivo} setPedidoActivo={setPedidoActivo} />}
+          {tab === "pedido" && <TabPedido bateas={bateas} barcos={barcos} poligonos={poligonos} cierres={cierres} exclusiones={exclusiones} setBateas={setBateas} setHistorial={setHistorial} historial={historial} pedidoActivo={pedidoActivo} setPedidoActivo={setPedidoActivo} pushUndo={pushUndo} undoStack={undoStack} onUndo={undoLast} />}
           {tab === "flota" && <TabFlota barcos={barcos} bateas={bateas} poligonos={poligonos} cierres={cierres} setBarcos={setBarcos} setBateas={setBateas} />}
           {tab === "cierres" && <TabCierres poligonos={poligonos} barcos={barcos} bateas={bateas} cierres={cierres} setCierres={setCierres} setBateas={setBateas} historial={historial} />}
           {tab === "exclusiones" && <TabExclusiones barcos={barcos} exclusiones={exclusiones} setExclusiones={setExclusiones} />}
