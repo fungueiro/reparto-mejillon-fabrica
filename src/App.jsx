@@ -1212,8 +1212,198 @@ function VistaSocio({ barcos, bateas, poligonos, cierres, exclusiones, barcoId }
   );
 }
 
+/* ── IMPORTAR FLOTA DESDE EXCEL / CSV ──────────────────────── */
+// Cada fila del Excel = una batea = una posición de la lista. Columnas
+// reconocidas (cabecera, sin distinguir mayúsculas/acentos): Barco y Polígono
+// (obligatorias), Orden y PIN (opcionales). Reutiliza SheetJS (ya es dependencia).
+const normHdr = (s) =>
+  String(s ?? "").trim().toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+const ALIAS_IMP = {
+  orden: ["orden", "posicion", "pos", "n", "no", "numero", "#"],
+  barco: ["barco", "embarcacion", "buque", "nombre"],
+  poligono: ["poligono", "pol", "zona"],
+  pin: ["pin", "clave", "codigo"],
+};
+function clasifHdr(celda) {
+  const n = normHdr(celda);
+  for (const [k, al] of Object.entries(ALIAS_IMP)) if (al.includes(n)) return k;
+  return null;
+}
+function interpretarFlotaImport(matriz) {
+  let hi = -1, mapa = {};
+  for (let i = 0; i < matriz.length; i++) {
+    const m = {};
+    (matriz[i] || []).forEach((celda, col) => {
+      const k = clasifHdr(celda);
+      if (k && !(k in m)) m[k] = col;
+    });
+    if ("barco" in m && "poligono" in m) { hi = i; mapa = m; break; }
+  }
+  if (hi < 0)
+    return { ok: false, error: "No se encontraron las columnas obligatorias «Barco» y «Polígono» en la fila de cabecera." };
+  const registros = [], errores = [];
+  const hayOrden = mapa.orden != null;
+  for (let i = hi + 1; i < matriz.length; i++) {
+    const fila = matriz[i] || [];
+    const barco = String(fila[mapa.barco] ?? "").trim();
+    const poligono = String(fila[mapa.poligono] ?? "").trim();
+    if (!barco && !poligono) continue;
+    if (!barco || !poligono) { errores.push(`Fila ${i + 1}: falta ${!barco ? "barco" : "polígono"}.`); continue; }
+    const pin = mapa.pin != null ? String(fila[mapa.pin] ?? "").replace(/\D/g, "").slice(0, 4) : "";
+    let orden = null;
+    if (hayOrden) { const v = parseInt(String(fila[mapa.orden] ?? "").trim(), 10); orden = Number.isFinite(v) ? v : null; }
+    registros.push({ orden, barco, poligono, pin });
+  }
+  if (!registros.length) return { ok: false, error: "No hay filas de datos para importar." };
+  if (hayOrden && registros.every((r) => r.orden != null)) {
+    const ord = registros.map((r, i) => ({ r, i })).sort((a, b) => a.r.orden - b.r.orden || a.i - b.i).map((x) => x.r);
+    registros.length = 0; registros.push(...ord);
+  }
+  const nb = new Set(registros.map((r) => normHdr(r.barco)));
+  const np = new Set(registros.map((r) => normHdr(r.poligono)));
+  return { ok: true, registros, errores, resumen: { barcos: nb.size, poligonos: np.size, bateas: registros.length } };
+}
+function construirFlotaImport(registros) {
+  const polMap = new Map(), poligonos = [];
+  const barcoMap = new Map(), barcos = [];
+  const bateas = [];
+  for (const r of registros) {
+    const kp = normHdr(r.poligono);
+    let pol = polMap.get(kp);
+    if (!pol) { pol = { id: uid(), nombre: r.poligono.trim() }; polMap.set(kp, pol); poligonos.push(pol); }
+    const kb = normHdr(r.barco);
+    let barco = barcoMap.get(kb);
+    if (!barco) { barco = { id: uid(), nombre: r.barco.trim(), pin: r.pin || "0000", activo: true }; barcoMap.set(kb, barco); barcos.push(barco); }
+    else if ((!barco.pin || barco.pin === "0000") && r.pin) barco.pin = r.pin;
+    bateas.push({ id: uid(), barcoId: barco.id, poligonoId: pol.id, posicion: 0, viajesAcum: 0, rechazosAcum: 0 });
+  }
+  return { poligonos, barcos, bateas: recalc(bateas) };
+}
+
+function ImportarFlotaCard({ onAplicar }) {
+  const [error, setError] = useState("");
+  const [datos, setDatos] = useState(null);
+  const [hecho, setHecho] = useState(false);
+  const [leyendo, setLeyendo] = useState(false);
+
+  const onArchivo = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLeyendo(true); setError(""); setDatos(null); setHecho(false);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf);
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const matriz = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, defval: "" });
+      const res = interpretarFlotaImport(matriz);
+      if (!res.ok) setError(res.error); else setDatos(res);
+    } catch (_) {
+      setError("No se pudo leer el archivo. Debe ser un Excel (.xlsx) o CSV válido.");
+    } finally { setLeyendo(false); e.target.value = ""; }
+  };
+
+  const confirmar = () => {
+    if (!datos) return;
+    if (!window.confirm("Esto REEMPLAZA la flota, los polígonos y el orden de la lista, y borra los cierres y exclusiones activos. El historial y la contraseña se conservan. ¿Continuar?")) return;
+    onAplicar(datos.registros);
+    setDatos(null); setHecho(true);
+    setTimeout(() => setHecho(false), 5000);
+  };
+
+  const plantilla = () => {
+    const wb = XLSX.utils.book_new();
+    const aoa = [
+      ["Orden", "Barco", "Poligono", "PIN"],
+      [1, "Rías Baixas", "Polígono A — Vilagarcía", "1111"],
+      [2, "A Marola", "Polígono A — Vilagarcía", "2222"],
+      [3, "Corrubedo", "Polígono B — O Grove", "3333"],
+      [4, "Rías Baixas", "Polígono B — O Grove", "1111"],
+      [5, "Ondina", "Polígono C — Cambados", "4444"],
+    ];
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), "Flota");
+    XLSX.writeFile(wb, "plantilla_flota.xlsx");
+  };
+
+  return (
+    <Card style={{ gridColumn: "1 / -1", borderColor: `${C.violet}40` }}>
+      <div className="cond" style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 6 }}>📥 Importar flota desde Excel</div>
+      <div style={{ fontSize: 13, color: C.textMid, marginBottom: 14, maxWidth: 640 }}>
+        Cada fila es una <strong>batea</strong> = una posición de la lista. Columnas: <span className="mono" style={{ color: C.text }}>Barco</span> y <span className="mono" style={{ color: C.text }}>Polígono</span> (obligatorias), <span className="mono" style={{ color: C.text }}>Orden</span> y <span className="mono" style={{ color: C.text }}>PIN</span> (opcionales). Acepta .xlsx y .csv.
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+        <label style={{ display: "inline-block" }}>
+          <span style={{ background: C.blue, color: "#fff", padding: "8px 18px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "inline-block" }}>
+            {leyendo ? "Leyendo…" : "Elegir archivo…"}
+          </span>
+          <input type="file" accept=".xlsx,.xls,.csv" onChange={onArchivo} style={{ display: "none" }} />
+        </label>
+        <Btn outline onClick={plantilla}>⬇ Descargar plantilla</Btn>
+      </div>
+
+      {error && <div style={{ fontSize: 13, color: C.red, background: "#1f0808", borderRadius: 8, padding: "10px 14px", marginTop: 14 }}>⚠ {error}</div>}
+      {hecho && <div style={{ fontSize: 13, color: C.green, background: "#0a2010", borderRadius: 8, padding: "10px 14px", marginTop: 14 }}>✓ Flota importada correctamente.</div>}
+
+      {datos && (
+        <div style={{ marginTop: 16 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+            {[
+              [`${datos.resumen.barcos}`, "barcos"],
+              [`${datos.resumen.poligonos}`, "polígonos"],
+              [`${datos.resumen.bateas}`, "bateas / posiciones"],
+            ].map(([n, t]) => (
+              <span key={t} className="mono" style={{ fontSize: 12, color: C.text, background: C.navy, border: `1px solid ${C.border2}`, padding: "4px 12px", borderRadius: 20 }}>
+                <strong style={{ color: C.accent }}>{n}</strong> {t}
+              </span>
+            ))}
+          </div>
+
+          {datos.errores?.length > 0 && (
+            <div style={{ fontSize: 12, color: C.accentL, background: "#1a1400", border: `1px solid ${C.accent}40`, borderRadius: 8, padding: "10px 14px", marginBottom: 12 }}>
+              {datos.errores.length} fila(s) omitida(s): {datos.errores.slice(0, 4).join(" ")} {datos.errores.length > 4 ? "…" : ""}
+            </div>
+          )}
+
+          <div style={{ overflowX: "auto", borderRadius: 10, border: `1px solid ${C.border}`, marginBottom: 14 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 480 }}>
+              <thead>
+                <tr>{["#", "Barco", "Polígono", "PIN"].map((h) => (
+                  <th key={h} style={{ background: "#0a1520", color: C.textDim, padding: "8px 12px", textAlign: "left", fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'Barlow Condensed', sans-serif", borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                ))}</tr>
+              </thead>
+              <tbody>
+                {datos.registros.slice(0, 12).map((r, i) => (
+                  <tr key={i} style={{ background: i % 2 === 0 ? C.surface : C.bg, borderBottom: `1px solid ${C.border}` }}>
+                    <td className="mono" style={{ padding: "7px 12px", color: C.textDim }}>{i + 1}</td>
+                    <td style={{ padding: "7px 12px", color: C.text, fontWeight: 600 }}>{r.barco}</td>
+                    <td style={{ padding: "7px 12px", color: C.textMid, fontSize: 12 }}>{r.poligono}</td>
+                    <td className="mono" style={{ padding: "7px 12px", color: C.textDim }}>{r.pin || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {datos.registros.length > 12 && (
+              <div style={{ padding: "6px 12px", fontSize: 11, color: C.textDim }}>… y {datos.registros.length - 12} fila(s) más.</div>
+            )}
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <Btn onClick={confirmar} color={C.green}>Importar y reemplazar</Btn>
+            <Btn outline onClick={() => setDatos(null)}>Cancelar</Btn>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 /* ── TAB CONFIGURACIÓN ─────────────────────────────────────── */
-function TabConfig({ barcos, setBarcos, oficinistaPass, setOficinistaPass, poligonos, setPoligonos, bateas }) {
+function TabConfig({ barcos, setBarcos, oficinistaPass, setOficinistaPass, poligonos, setPoligonos, bateas, setBateas, setCierres, setExclusiones }) {
+  const aplicarImport = (registros) => {
+    const { poligonos: np, barcos: nb, bateas: nbt } = construirFlotaImport(registros);
+    setPoligonos(np); setBarcos(nb); setBateas(nbt);
+    setCierres([]); setExclusiones([]);
+  };
   const [newPass, setNewPass] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
   const [passMsg, setPassMsg] = useState("");
@@ -1298,6 +1488,8 @@ function TabConfig({ barcos, setBarcos, oficinistaPass, setOficinistaPass, polig
             <Btn onClick={addPol} color={C.green} disabled={!nuevoPol.trim()}>+ Añadir</Btn>
           </div>
         </Card>
+
+        <ImportarFlotaCard onAplicar={aplicarImport} />
       </div>
     </div>
   );
@@ -1447,7 +1639,7 @@ export default function App() {
           {tab === "cierres" && <TabCierres poligonos={poligonos} barcos={barcos} bateas={bateas} cierres={cierres} setCierres={setCierres} setBateas={setBateas} historial={historial} />}
           {tab === "exclusiones" && <TabExclusiones barcos={barcos} exclusiones={exclusiones} setExclusiones={setExclusiones} />}
           {tab === "historial" && <TabHistorial historial={historial} />}
-          {tab === "config" && <TabConfig barcos={barcos} setBarcos={setBarcos} oficinistaPass={oficinistaPass} setOficinistaPass={setOficinistaPass} poligonos={poligonos} setPoligonos={setPoligonos} bateas={bateas} />}
+          {tab === "config" && <TabConfig barcos={barcos} setBarcos={setBarcos} oficinistaPass={oficinistaPass} setOficinistaPass={setOficinistaPass} poligonos={poligonos} setPoligonos={setPoligonos} bateas={bateas} setBateas={setBateas} setCierres={setCierres} setExclusiones={setExclusiones} />}
         </main>
       </div>
     </>
