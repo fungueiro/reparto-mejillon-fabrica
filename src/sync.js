@@ -1,400 +1,108 @@
 import { supabase } from "./supabaseClient";
 
-/* ── SINCRONIZACIÓN DE POLÍGONOS ─────────────────────────────────── */
-export async function loadPoligonos() {
-  try {
-    const { data, error } = await supabase
-      .from("poligonos")
-      .select("id, nombre")
-      .order("nombre");
+/* ════════════════════════════════════════════════════════════════
+   SINCRONIZACIÓN MULTIDISPOSITIVO
+   Supabase es la fuente de la verdad. La oficina (oficinista) escribe;
+   todos los dispositivos leen al abrir y se refrescan periódicamente.
+   - loadAll(): trae todo el estado desde Supabase.
+   - saveAll(state): reemplazo completo (upsert + borra lo que ya no está).
+   localStorage se usa solo como caché offline.
+   ════════════════════════════════════════════════════════════════ */
 
+async function safe(promise, label) {
+  try {
+    const { data, error } = await promise;
     if (error) {
-      console.warn("Error cargando polígonos:", error);
-      return null;
+      console.warn(`[sync] ${label}:`, error.message || error);
+      return { ok: false, data: null };
     }
-
-    return data || [];
+    return { ok: true, data };
   } catch (err) {
-    console.warn("Error en loadPoligonos:", err);
-    return null;
+    console.warn(`[sync] ${label}:`, err);
+    return { ok: false, data: null };
   }
 }
 
-export async function syncPoligonos(poligonos) {
-  try {
-    const { data: existing } = await supabase
-      .from("poligonos")
-      .select("id, nombre");
+/* ── CARGA ──────────────────────────────────────────────────── */
+export async function loadAll() {
+  const [pol, bar, bat, cie, exc, his] = await Promise.all([
+    safe(supabase.from("poligonos").select("id,nombre").order("nombre"), "load poligonos"),
+    safe(supabase.from("barcos").select("id,nombre,pin,activo").order("nombre"), "load barcos"),
+    safe(supabase.from("bateas").select("id,barco_id,poligono_id,posicion,viajes_acum,rechazos_acum").order("posicion"), "load bateas"),
+    safe(supabase.from("cierres").select("id,poligono_id,fecha_inicio,fecha_fin,created_ts").order("created_ts", { ascending: false }), "load cierres"),
+    safe(supabase.from("exclusiones").select("id,barco_id,fecha_inicio,fecha_fin").order("fecha_inicio"), "load exclusiones"),
+    safe(supabase.from("historial").select("id,fecha,descripcion,ts,lineas").order("ts", { ascending: false }), "load historial"),
+  ]);
 
-    const existingIds = new Set(existing?.map(p => p.id) || []);
-    const newPoligonos = poligonos.filter(p => !existingIds.has(p.id));
+  // Si ni siquiera las tablas base responden, asumimos sin conexión / sin permisos.
+  if (!pol.ok && !bar.ok && !bat.ok) return null;
 
-    if (newPoligonos.length > 0) {
-      const { error } = await supabase
-        .from("poligonos")
-        .insert(newPoligonos.map(p => ({ id: p.id, nombre: p.nombre })));
-
-      if (error) {
-        console.warn("Error guardando polígonos:", error);
-        return false;
-      }
-    }
-
-    return true;
-  } catch (err) {
-    console.warn("Error en syncPoligonos:", err);
-    return false;
-  }
+  return {
+    poligonos: pol.data || [],
+    barcos: bar.data || [],
+    bateas: (bat.data || []).map((b) => ({
+      id: b.id, barcoId: b.barco_id, poligonoId: b.poligono_id,
+      posicion: b.posicion, viajesAcum: b.viajes_acum, rechazosAcum: b.rechazos_acum,
+    })),
+    cierres: (cie.data || []).map((c) => ({
+      id: c.id, poligonoId: c.poligono_id, fechaInicio: c.fecha_inicio,
+      fechaFin: c.fecha_fin, createdTs: c.created_ts, porBatea: 0,
+    })),
+    exclusiones: (exc.data || []).map((e) => ({
+      id: e.id, barcoId: e.barco_id, fechaInicio: e.fecha_inicio, fechaFin: e.fecha_fin,
+    })),
+    historial: (his.data || []).map((h) => ({
+      id: h.id, fecha: h.fecha, desc: h.descripcion, ts: h.ts, lineas: h.lineas || [],
+    })),
+  };
 }
 
-/* ── SINCRONIZACIÓN DE BARCOS ─────────────────────────────────────── */
-export async function loadBarcos() {
-  try {
-    const { data, error } = await supabase
-      .from("barcos")
-      .select("id, nombre, pin, activo")
-      .order("nombre");
-
-    if (error) {
-      console.warn("Error cargando barcos:", error);
-      return null;
-    }
-
-    return data || [];
-  } catch (err) {
-    console.warn("Error en loadBarcos:", err);
-    return null;
-  }
+/* ── GUARDADO (reemplazo completo) ──────────────────────────── */
+async function upsertTabla(tabla, filas) {
+  if (filas.length) await safe(supabase.from(tabla).upsert(filas), `upsert ${tabla}`);
+}
+async function podarTabla(tabla, filas) {
+  const ex = await safe(supabase.from(tabla).select("id"), `ids ${tabla}`);
+  if (!ex.ok || !ex.data) return;
+  const conservar = new Set(filas.map((f) => f.id));
+  const borrar = ex.data.map((r) => r.id).filter((id) => !conservar.has(id));
+  if (borrar.length) await safe(supabase.from(tabla).delete().in("id", borrar), `borrar ${tabla}`);
 }
 
-export async function syncBarcos(barcos) {
-  try {
-    const { data: existing } = await supabase
-      .from("barcos")
-      .select("id");
+export async function saveAll(state) {
+  const P = state.poligonos.map((p) => ({ id: p.id, nombre: p.nombre }));
+  const B = state.barcos.map((b) => ({ id: b.id, nombre: b.nombre, pin: b.pin, activo: b.activo }));
+  const BT = state.bateas.map((b) => ({
+    id: b.id, barco_id: b.barcoId, poligono_id: b.poligonoId,
+    posicion: b.posicion, viajes_acum: b.viajesAcum, rechazos_acum: b.rechazosAcum,
+  }));
+  const C = state.cierres.map((c) => ({
+    id: c.id, poligono_id: c.poligonoId, fecha_inicio: c.fechaInicio,
+    fecha_fin: c.fechaFin, created_ts: c.createdTs,
+  }));
+  const E = state.exclusiones.map((e) => ({
+    id: e.id, barco_id: e.barcoId, fecha_inicio: e.fechaInicio, fecha_fin: e.fechaFin,
+  }));
+  const H = state.historial.map((h) => ({
+    id: h.id, fecha: h.fecha, descripcion: h.desc || null, ts: h.ts, lineas: h.lineas,
+  }));
 
-    const existingIds = new Set(existing?.map(b => b.id) || []);
-    const newBarcos = barcos.filter(b => !existingIds.has(b.id));
-
-    if (newBarcos.length > 0) {
-      const { error } = await supabase
-        .from("barcos")
-        .insert(newBarcos.map(b => ({
-          id: b.id,
-          nombre: b.nombre,
-          pin: b.pin,
-          activo: b.activo
-        })));
-
-      if (error) {
-        console.warn("Error guardando barcos:", error);
-        return false;
-      }
-    }
-
-    // Actualizar barcos existentes (activo)
-    for (const barco of barcos.filter(b => existingIds.has(b.id))) {
-      const { error } = await supabase
-        .from("barcos")
-        .update({ activo: barco.activo })
-        .eq("id", barco.id);
-
-      if (error) console.warn("Error actualizando barco:", error);
-    }
-
-    return true;
-  } catch (err) {
-    console.warn("Error en syncBarcos:", err);
-    return false;
-  }
-}
-
-/* ── SINCRONIZACIÓN DE BATEAS ─────────────────────────────────────── */
-export async function loadBateas() {
-  try {
-    const { data, error } = await supabase
-      .from("bateas")
-      .select("id, barco_id, poligono_id, posicion, viajes_acum, rechazos_acum")
-      .order("posicion");
-
-    if (error) {
-      console.warn("Error cargando bateas:", error);
-      return null;
-    }
-
-    // Convertir nombres de columnas (snake_case a camelCase)
-    return (data || []).map(b => ({
-      id: b.id,
-      barcoId: b.barco_id,
-      poligonoId: b.poligono_id,
-      posicion: b.posicion,
-      viajesAcum: b.viajes_acum,
-      rechazosAcum: b.rechazos_acum
-    }));
-  } catch (err) {
-    console.warn("Error en loadBateas:", err);
-    return null;
-  }
-}
-
-export async function syncBateas(bateas) {
-  try {
-    const { data: existing } = await supabase
-      .from("bateas")
-      .select("id");
-
-    const existingIds = new Set(existing?.map(b => b.id) || []);
-    const newBateas = bateas.filter(b => !existingIds.has(b.id));
-
-    if (newBateas.length > 0) {
-      const { error } = await supabase
-        .from("bateas")
-        .insert(newBateas.map(b => ({
-          id: b.id,
-          barco_id: b.barcoId,
-          poligono_id: b.poligonoId,
-          posicion: b.posicion,
-          viajes_acum: b.viajesAcum,
-          rechazos_acum: b.rechazosAcum
-        })));
-
-      if (error) {
-        console.warn("Error guardando bateas:", error);
-        return false;
-      }
-    }
-
-    // Actualizar bateas existentes
-    for (const batea of bateas.filter(b => existingIds.has(b.id))) {
-      const { error } = await supabase
-        .from("bateas")
-        .update({
-          posicion: batea.posicion,
-          viajes_acum: batea.viajesAcum,
-          rechazos_acum: batea.rechazosAcum
-        })
-        .eq("id", batea.id);
-
-      if (error) console.warn("Error actualizando batea:", error);
-    }
-
-    return true;
-  } catch (err) {
-    console.warn("Error en syncBateas:", err);
-    return false;
-  }
-}
-
-/* ── SINCRONIZACIÓN DE CIERRES ────────────────────────────────────── */
-export async function loadCierres() {
-  try {
-    const { data, error } = await supabase
-      .from("cierres")
-      .select("id, poligono_id, fecha_inicio, fecha_fin, created_ts")
-      .order("created_ts", { ascending: false });
-
-    if (error) {
-      console.warn("Error cargando cierres:", error);
-      return null;
-    }
-
-    return (data || []).map(c => ({
-      id: c.id,
-      poligonoId: c.poligono_id,
-      fechaInicio: c.fecha_inicio,
-      fechaFin: c.fecha_fin,
-      createdTs: c.created_ts
-    }));
-  } catch (err) {
-    console.warn("Error en loadCierres:", err);
-    return null;
-  }
-}
-
-export async function syncCierres(cierres) {
-  try {
-    const { data: existing } = await supabase
-      .from("cierres")
-      .select("id");
-
-    const existingIds = new Set(existing?.map(c => c.id) || []);
-    const newCierres = cierres.filter(c => !existingIds.has(c.id));
-
-    if (newCierres.length > 0) {
-      const { error } = await supabase
-        .from("cierres")
-        .insert(newCierres.map(c => ({
-          id: c.id,
-          poligono_id: c.poligonoId,
-          fecha_inicio: c.fechaInicio,
-          fecha_fin: c.fechaFin,
-          created_ts: c.createdTs
-        })));
-
-      if (error) {
-        console.warn("Error guardando cierres:", error);
-        return false;
-      }
-    }
-
-    // Actualizar cierres existentes (fecha_fin)
-    for (const cierre of cierres.filter(c => existingIds.has(c.id))) {
-      const { error } = await supabase
-        .from("cierres")
-        .update({ fecha_fin: cierre.fechaFin })
-        .eq("id", cierre.id);
-
-      if (error) console.warn("Error actualizando cierre:", error);
-    }
-
-    return true;
-  } catch (err) {
-    console.warn("Error en syncCierres:", err);
-    return false;
-  }
-}
-
-/* ── SINCRONIZACIÓN DE EXCLUSIONES ────────────────────────────────── */
-export async function loadExclusiones() {
-  try {
-    const { data, error } = await supabase
-      .from("exclusiones")
-      .select("id, barco_id, fecha_inicio, fecha_fin")
-      .order("fecha_inicio");
-
-    if (error) {
-      console.warn("Error cargando exclusiones:", error);
-      return null;
-    }
-
-    return (data || []).map(e => ({
-      id: e.id,
-      barcoId: e.barco_id,
-      fechaInicio: e.fecha_inicio,
-      fechaFin: e.fecha_fin
-    }));
-  } catch (err) {
-    console.warn("Error en loadExclusiones:", err);
-    return null;
-  }
-}
-
-export async function syncExclusiones(exclusiones) {
-  try {
-    const { data: existing } = await supabase
-      .from("exclusiones")
-      .select("id");
-
-    const existingIds = new Set(existing?.map(e => e.id) || []);
-    const newExclusiones = exclusiones.filter(e => !existingIds.has(e.id));
-
-    if (newExclusiones.length > 0) {
-      const { error } = await supabase
-        .from("exclusiones")
-        .insert(newExclusiones.map(e => ({
-          id: e.id,
-          barco_id: e.barcoId,
-          fecha_inicio: e.fechaInicio,
-          fecha_fin: e.fechaFin
-        })));
-
-      if (error) {
-        console.warn("Error guardando exclusiones:", error);
-        return false;
-      }
-    }
-
-    // Actualizar exclusiones existentes
-    for (const excl of exclusiones.filter(e => existingIds.has(e.id))) {
-      const { error } = await supabase
-        .from("exclusiones")
-        .update({ fecha_fin: excl.fechaFin })
-        .eq("id", excl.id);
-
-      if (error) console.warn("Error actualizando exclusión:", error);
-    }
-
-    return true;
-  } catch (err) {
-    console.warn("Error en syncExclusiones:", err);
-    return false;
-  }
-}
-
-/* ── SINCRONIZACIÓN DE HISTORIAL ──────────────────────────────────── */
-export async function loadHistorial() {
-  try {
-    const { data, error } = await supabase
-      .from("historial")
-      .select("id, fecha, descripcion, ts, lineas")
-      .order("ts", { ascending: false });
-
-    if (error) {
-      console.warn("Error cargando historial:", error);
-      return null;
-    }
-
-    return (data || []).map(h => ({
-      id: h.id,
-      fecha: h.fecha,
-      descripcion: h.descripcion,
-      ts: h.ts,
-      lineas: h.lineas || []
-    }));
-  } catch (err) {
-    console.warn("Error en loadHistorial:", err);
-    return null;
-  }
-}
-
-export async function syncHistorial(historial) {
-  try {
-    const { data: existing } = await supabase
-      .from("historial")
-      .select("id");
-
-    const existingIds = new Set(existing?.map(h => h.id) || []);
-    const newHistorial = historial.filter(h => !existingIds.has(h.id));
-
-    if (newHistorial.length > 0) {
-      const { error } = await supabase
-        .from("historial")
-        .insert(newHistorial.map(h => ({
-          id: h.id,
-          fecha: h.fecha,
-          descripcion: h.descripcion,
-          ts: h.ts,
-          lineas: h.lineas
-        })));
-
-      if (error) {
-        console.warn("Error guardando historial:", error);
-        return false;
-      }
-    }
-
-    return true;
-  } catch (err) {
-    console.warn("Error en syncHistorial:", err);
-    return false;
-  }
-}
-
-/* ── SINCRONIZACIÓN COMPLETA ──────────────────────────────────────── */
-export async function syncAllData(poligonos, barcos, bateas, cierres, exclusiones, historial) {
-  try {
-    const results = await Promise.all([
-      syncPoligonos(poligonos),
-      syncBarcos(barcos),
-      syncBateas(bateas),
-      syncCierres(cierres),
-      syncExclusiones(exclusiones),
-      syncHistorial(historial)
-    ]);
-
-    return results.every(r => r === true);
-  } catch (err) {
-    console.warn("Error en syncAllData:", err);
-    return false;
-  }
+  // Padres primero (por si hay claves foráneas), luego hijos.
+  await upsertTabla("poligonos", P);
+  await upsertTabla("barcos", B);
+  await Promise.all([
+    upsertTabla("bateas", BT),
+    upsertTabla("cierres", C),
+    upsertTabla("exclusiones", E),
+    upsertTabla("historial", H),
+  ]);
+  // Podar hijos antes que padres.
+  await Promise.all([
+    podarTabla("bateas", BT),
+    podarTabla("cierres", C),
+    podarTabla("exclusiones", E),
+    podarTabla("historial", H),
+  ]);
+  await podarTabla("barcos", B);
+  await podarTabla("poligonos", P);
 }

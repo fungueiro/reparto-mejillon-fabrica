@@ -1,7 +1,7 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
 import html2canvas from "html2canvas";
-import { syncAllData } from "./sync";
+import { loadAll, saveAll } from "./sync";
 
 /* ═══════════════════════════════════════════════════════════════
    REPARTO DE VIAJES · FÁBRICA · MEJILLÓN
@@ -1520,35 +1520,77 @@ export default function App() {
   const [role, setRole] = useState(null);
   const [patronBarcoId, setPatronBarcoId] = useState(null);
   const [loaded, setLoaded] = useState(false);
+  const [offline, setOffline] = useState(false);
+  const skipSave = useRef(false); // evita re-guardar justo después de cargar de Supabase
 
-  /* Persistencia en localStorage */
+  // Aplica un estado completo recibido (de Supabase o de la caché local).
+  const aplicarEstado = (s) => {
+    if (s.poligonos) setPoligonos(s.poligonos);
+    if (s.barcos) setBarcos(s.barcos);
+    if (s.bateas) setBateas(s.bateas);
+    setCierres(s.cierres || []);
+    setExclusiones(s.exclusiones || []);
+    setHistorial(s.historial || []);
+  };
+
+  /* Carga inicial: Supabase es la fuente de la verdad; localStorage es respaldo. */
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem("fabrica-state");
-      if (raw) {
-        const s = JSON.parse(raw);
-        if (s.poligonos) setPoligonos(s.poligonos);
-        if (s.barcos) setBarcos(s.barcos);
-        if (s.bateas) setBateas(s.bateas);
-        if (s.cierres) setCierres(s.cierres);
-        if (s.exclusiones) setExclusiones(s.exclusiones);
-        if (s.historial) setHistorial(s.historial);
-        if (s.oficinistaPass) setOficinistaPass(s.oficinistaPass);
+    let cancelado = false;
+    (async () => {
+      // La contraseña de oficinista vive solo en local (no se sincroniza).
+      try {
+        const raw = localStorage.getItem("fabrica-state");
+        if (raw) { const s = JSON.parse(raw); if (s.oficinistaPass) setOficinistaPass(s.oficinistaPass); }
+      } catch (_) {}
+
+      const remoto = await loadAll();
+      if (cancelado) return;
+
+      if (remoto && remoto.poligonos.length > 0) {
+        skipSave.current = true;
+        aplicarEstado(remoto);
+      } else {
+        // Supabase vacío o sin conexión: arrancamos desde la caché local si existe.
+        try {
+          const raw = localStorage.getItem("fabrica-state");
+          if (raw) { skipSave.current = true; aplicarEstado(JSON.parse(raw)); }
+        } catch (_) {}
+        if (!remoto) setOffline(true);
       }
-    } catch (_) {}
-    setLoaded(true);
+      setLoaded(true);
+    })();
+    return () => { cancelado = true; };
   }, []);
 
+  /* Guardado: caché local siempre; Supabase solo desde la oficina (un único editor). */
   useEffect(() => {
     if (!loaded) return;
     try {
       localStorage.setItem("fabrica-state", JSON.stringify({ poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass }));
-      // Sincronizar con Supabase
-      syncAllData(poligonos, barcos, bateas, cierres, exclusiones, historial).catch(err =>
-        console.warn("Error sincronizando datos con Supabase:", err)
-      );
     } catch (_) {}
-  }, [poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass, loaded]);
+    if (skipSave.current) { skipSave.current = false; return; }
+    if (role !== "oficinista") return;
+    const t = setTimeout(() => {
+      saveAll({ poligonos, barcos, bateas, cierres, exclusiones, historial })
+        .then(() => setOffline(false))
+        .catch(() => setOffline(true));
+    }, 800);
+    return () => clearTimeout(t);
+  }, [poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass, loaded, role]);
+
+  /* Refresco automático para socios: recarga de Supabase cada 15 s y al volver a la pestaña. */
+  useEffect(() => {
+    if (role !== "patron") return;
+    let parar = false;
+    const refrescar = async () => {
+      const r = await loadAll();
+      if (!parar && r && r.poligonos.length > 0) { skipSave.current = true; aplicarEstado(r); }
+    };
+    const iv = setInterval(refrescar, 15000);
+    const onFocus = () => refrescar();
+    window.addEventListener("focus", onFocus);
+    return () => { parar = true; clearInterval(iv); window.removeEventListener("focus", onFocus); };
+  }, [role]);
 
   /* Deshacer: guarda estado previo a cada pedido y permite revertir (hasta 10 pasos) */
   const pushUndo = (snap) => setUndoStack((s) => [...s, snap].slice(-10));
@@ -1615,6 +1657,11 @@ export default function App() {
           {pedidoActivo && (
             <div style={{ fontSize: 12, fontWeight: 700, color: C.accent, background: "#1a1400", border: `1px solid ${C.accent}50`, padding: "4px 14px", borderRadius: 20 }}>
               ⚠ Pedido en curso — {pedidoActivo.fecha}
+            </div>
+          )}
+          {offline && (
+            <div title="No se pudo conectar con la base de datos en la nube. Los cambios se guardan en este equipo y se sincronizarán cuando vuelva la conexión." style={{ fontSize: 12, fontWeight: 700, color: C.red, background: "#1f0808", border: `1px solid ${C.red}50`, padding: "4px 14px", borderRadius: 20 }}>
+              ⚠ Sin conexión — solo local
             </div>
           )}
           <button onClick={() => setRole(null)} style={{ marginLeft: "auto", background: "transparent", border: `1px solid ${C.border2}`, color: C.textMid, padding: "5px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12 }}>Cerrar sesión</button>
