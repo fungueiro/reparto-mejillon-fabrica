@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect } from "react";
 import * as XLSX from "xlsx";
 import html2canvas from "html2canvas";
+import { syncAllData } from "./sync";
 
 /* ═══════════════════════════════════════════════════════════════
    REPARTO DE VIAJES · FÁBRICA · MEJILLÓN
@@ -1350,6 +1351,10 @@ export default function App() {
     if (!loaded) return;
     try {
       localStorage.setItem("fabrica-state", JSON.stringify({ poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass }));
+      // Sincronizar con Supabase
+      syncAllData(poligonos, barcos, bateas, cierres, exclusiones, historial).catch(err =>
+        console.warn("Error sincronizando datos con Supabase:", err)
+      );
     } catch (_) {}
   }, [poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass, loaded]);
 
