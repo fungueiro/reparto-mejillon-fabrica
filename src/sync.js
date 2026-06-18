@@ -28,7 +28,7 @@ export async function loadAll() {
   const [pol, bar, bat, cie, exc, his] = await Promise.all([
     safe(supabase.from("poligonos").select("id,nombre").order("nombre"), "load poligonos"),
     safe(supabase.from("barcos").select("id,nombre,pin,activo").order("nombre"), "load barcos"),
-    safe(supabase.from("bateas").select("id,barco_id,poligono_id,posicion,viajes_acum,rechazos_acum").order("posicion"), "load bateas"),
+    safe(supabase.from("bateas").select("id,barco_id,poligono_id,posicion,viajes_acum,rechazos_acum,media,media_salta").order("posicion"), "load bateas"),
     safe(supabase.from("cierres").select("id,poligono_id,fecha_inicio,fecha_fin,created_ts").order("created_ts", { ascending: false }), "load cierres"),
     safe(supabase.from("exclusiones").select("id,barco_id,fecha_inicio,fecha_fin").order("fecha_inicio"), "load exclusiones"),
     safe(supabase.from("historial").select("id,fecha,descripcion,ts,lineas").order("ts", { ascending: false }), "load historial"),
@@ -43,6 +43,7 @@ export async function loadAll() {
     bateas: (bat.data || []).map((b) => ({
       id: b.id, barcoId: b.barco_id, poligonoId: b.poligono_id,
       posicion: b.posicion, viajesAcum: b.viajes_acum, rechazosAcum: b.rechazos_acum,
+      media: !!b.media, mediaSalta: !!b.media_salta,
     })),
     cierres: (cie.data || []).map((c) => ({
       id: c.id, poligonoId: c.poligono_id, fechaInicio: c.fecha_inicio,
@@ -75,6 +76,7 @@ export async function saveAll(state) {
   const BT = state.bateas.map((b) => ({
     id: b.id, barco_id: b.barcoId, poligono_id: b.poligonoId,
     posicion: b.posicion, viajes_acum: b.viajesAcum, rechazos_acum: b.rechazosAcum,
+    media: !!b.media, media_salta: !!b.mediaSalta,
   }));
   const C = state.cierres.map((c) => ({
     id: c.id, poligono_id: c.poligonoId, fecha_inicio: c.fechaInicio,

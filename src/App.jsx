@@ -129,6 +129,7 @@ function initBateas() {
     DEMO_BATEAS_DEF.map((d) => ({
       id: uid(), barcoId: d.barcoId, poligonoId: d.poligonoId,
       posicion: 0, viajesAcum: 0, rechazosAcum: 0,
+      media: false, mediaSalta: false,
     }))
   );
 }
@@ -420,7 +421,10 @@ function TabLista({ bateas, barcos, poligonos, cierres, exclusiones }) {
       pos: <span className="mono cond" style={{ fontSize: 18, fontWeight: 800, color: enCierre ? C.red : excl ? C.textDim : reales === 0 ? C.accentL : C.blue }}>{bt.posicion}</span>,
       barco: (
         <div>
-          <div style={{ fontWeight: 600, color: excl || enCierre ? C.textMid : C.text }}>{b?.nombre}</div>
+          <div style={{ fontWeight: 600, color: excl || enCierre ? C.textMid : C.text }}>
+            {b?.nombre}
+            {bt.media && <span style={{ marginLeft: 6, fontSize: 10, color: C.violet, fontWeight: 800 }} title="Media batea: sirve una vez de cada dos">½{bt.mediaSalta ? " salta" : ""}</span>}
+          </div>
           {bt.viajesAcum > 0 && <span style={{ fontSize: 10, color: C.accent, fontWeight: 700 }}>★ {bt.viajesAcum} viaje(s) acumulado(s)</span>}
         </div>
       ),
@@ -489,7 +493,10 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
         const { reales } = viajesParaQueLeToque(bt, bateas, barcos, cierres, exclusiones);
         return {
           bateaId: bt.id, barcoId: bt.barcoId, barcoNombre: b?.nombre, poligonoNombre: pol?.nombre,
-          posicion: bt.posicion, viajesAcum: bt.viajesAcum, faltan: reales, resultado: "rechaza",
+          posicion: bt.posicion, viajesAcum: bt.viajesAcum, faltan: reales,
+          media: !!bt.media, mediaSalta: !!bt.mediaSalta,
+          // Una media batea en turno de salto no sirve: por defecto "salta".
+          resultado: bt.media && bt.mediaSalta ? "salta" : "rechaza",
         };
       }),
     });
@@ -498,7 +505,12 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
   const upd = (bateaId, resultado) =>
     setPedidoActivo((p) => ({ ...p, asigs: p.asigs.map((a) => (a.bateaId === bateaId ? { ...a, resultado } : a)) }));
   const todas = (resultado) =>
-    setPedidoActivo((p) => ({ ...p, asigs: p.asigs.map((a) => ({ ...a, resultado })) }));
+    setPedidoActivo((p) => ({
+      ...p,
+      asigs: p.asigs.map((a) =>
+        a.media && a.mediaSalta ? { ...a, resultado: resultado === "sirve" ? "salta" : resultado } : { ...a, resultado }
+      ),
+    }));
 
   const confirmar = () => {
     if (!pedidoActivo) return;
@@ -509,17 +521,24 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
     pedidoActivo.asigs.forEach((a) => {
       const idx = arr.findIndex((b) => b.id === a.bateaId);
       if (idx < 0) return;
+      const b = arr[idx];
+
+      // Media batea en turno de salto: rota al final SIN servir y alterna su turno.
+      // (También si por lo que sea se marcó "sirve" estando en turno de salto.)
+      if (a.resultado === "salta" || (a.resultado === "sirve" && b.media && b.mediaSalta)) {
+        arr[idx] = { ...b, mediaSalta: false };
+        rotaIds.add(a.bateaId);
+        return;
+      }
+
       if (a.resultado === "sirve") {
-        const b = arr[idx];
         const nuevoAcum = Math.max(0, b.viajesAcum - 1);
-        arr[idx] = { ...b, viajesAcum: nuevoAcum, rechazosAcum: 0 };
+        // Si es media batea, tras servir pasa a "salta" para el próximo turno.
+        arr[idx] = { ...b, viajesAcum: nuevoAcum, rechazosAcum: 0, mediaSalta: b.media ? true : b.mediaSalta };
         lineas.push({ barcoNombre: a.barcoNombre, poligonoNombre: a.poligonoNombre, viajes: 1 });
         // Rota al final SOLO si no le queda cupo acumulado pendiente.
-        // Si sirvió consumiendo cupo acumulado y aún le queda, mantiene su posición
-        // hasta agotarlo (no pierde el turno mientras recupera viajes del cierre).
         if (nuevoAcum === 0) rotaIds.add(a.bateaId);
       } else {
-        const b = arr[idx];
         let rech = b.rechazosAcum + 1;
         let acum = b.viajesAcum;
         if (acum > 0 && rech >= 3) { acum = 0; rech = 0; } // 3 rechazos seguidos → pierde acumulado
@@ -571,8 +590,9 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
     );
   }
 
-  const nSirven = pedidoActivo.asigs.filter((a) => a.resultado === "sirve").length;
-  const nRechazan = pedidoActivo.asigs.length - nSirven;
+  const nSirven = pedidoActivo.asigs.filter((a) => a.resultado === "sirve" && !(a.media && a.mediaSalta)).length;
+  const nSalta = pedidoActivo.asigs.filter((a) => a.resultado === "salta").length;
+  const nRechazan = pedidoActivo.asigs.filter((a) => a.resultado === "rechaza").length;
 
   return (
     <div className="fade-in">
@@ -600,7 +620,7 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
           </thead>
           <tbody>
             {pedidoActivo.asigs.map((a, i) => {
-              const rowBg = a.resultado === "sirve" ? "#0d2b1a" : a.resultado === "rechaza" ? "#1f1010" : i % 2 === 0 ? C.surface : C.bg;
+              const rowBg = a.resultado === "sirve" ? "#0d2b1a" : a.resultado === "salta" ? "#180d2e" : a.resultado === "rechaza" ? "#1f1010" : i % 2 === 0 ? C.surface : C.bg;
               return (
                 <tr key={a.bateaId} style={{ background: rowBg, borderBottom: `1px solid ${C.border}` }}>
                   <td style={{ padding: "10px 14px" }}>
@@ -613,13 +633,14 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
                       ? <span style={{ color: C.green, fontWeight: 700 }}>¡Le toca!</span>
                       : <span style={{ color: C.textDim }}>Faltan {a.faltan}</span>}
                     {a.viajesAcum > 0 && <span style={{ marginLeft: 6, color: C.accent }}>★ {a.viajesAcum} acum.</span>}
+                    {a.media && <span style={{ marginLeft: 6, color: C.violet, fontWeight: 700 }}>½{a.mediaSalta ? " salta turno" : " media"}</span>}
                   </td>
                   <td style={{ padding: "10px 14px" }}>
                     <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-                      {[
-                        { r: "sirve", label: "SIRVE", col: C.green },
-                        { r: "rechaza", label: "RECHAZA", col: C.red },
-                      ].map(({ r, label, col }) => (
+                      {(a.media && a.mediaSalta
+                        ? [{ r: "salta", label: "½ SALTA", col: C.violet }, { r: "rechaza", label: "RECHAZA", col: C.red }]
+                        : [{ r: "sirve", label: "SIRVE", col: C.green }, { r: "rechaza", label: "RECHAZA", col: C.red }]
+                      ).map(({ r, label, col }) => (
                         <button key={r} onClick={() => upd(a.bateaId, r)}
                           style={{ padding: "6px 14px", borderRadius: 8, border: "none",
                             background: a.resultado === r ? col : C.navy,
@@ -636,11 +657,12 @@ function TabPedido({ bateas, barcos, poligonos, cierres, exclusiones, setBateas,
       </div>
       <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
         <Btn outline onClick={() => setPedidoActivo(null)}>Cancelar</Btn>
-        <Btn onClick={confirmar} color={C.green} disabled={nSirven === 0}>✓ Confirmar pedido</Btn>
+        <Btn onClick={confirmar} color={C.green} disabled={nSirven === 0 && nSalta === 0}>✓ Confirmar pedido</Btn>
         <span className="mono" style={{ fontSize: 13, color: C.textMid }}>
           <strong style={{ color: C.green }}>{nSirven}</strong> sirven · <strong style={{ color: C.red }}>{nRechazan}</strong> rechazan
+          {nSalta > 0 && <> · <strong style={{ color: C.violet }}>{nSalta}</strong> ½ saltan</>}
         </span>
-        {nSirven === 0 && <span style={{ fontSize: 12, color: C.textDim }}>Sin viajes (todas rechazaron).</span>}
+        {nSirven === 0 && nSalta === 0 && <span style={{ fontSize: 12, color: C.textDim }}>Sin viajes (todas rechazaron).</span>}
       </div>
     </div>
   );
@@ -662,7 +684,7 @@ function TabFlota({ barcos, bateas, poligonos, cierres, setBarcos, setBateas }) 
     setBarcos((x) => [...x, nb]);
     setBateas((bs) => recalc([
       ...bs,
-      ...Array.from({ length: n }, () => ({ id: uid(), barcoId: nb.id, poligonoId: form.poligonoId, posicion: 0, viajesAcum: 0, rechazosAcum: 0 })),
+      ...Array.from({ length: n }, () => ({ id: uid(), barcoId: nb.id, poligonoId: form.poligonoId, posicion: 0, viajesAcum: 0, rechazosAcum: 0, media: false, mediaSalta: false })),
     ]));
     setForm({ nombre: "", pin: "", poligonoId: "", nBateas: "1" }); setShow(false); setErr("");
   };
@@ -671,10 +693,14 @@ function TabFlota({ barcos, bateas, poligonos, cierres, setBarcos, setBateas }) 
     setBateas((bs) => bs.map((b) => (b.id === bateaId ? { ...b, poligonoId } : b)));
 
   const addBatea = (barcoId, poligonoId) =>
-    setBateas((bs) => recalc([...bs, { id: uid(), barcoId, poligonoId, posicion: 0, viajesAcum: 0, rechazosAcum: 0 }]));
+    setBateas((bs) => recalc([...bs, { id: uid(), barcoId, poligonoId, posicion: 0, viajesAcum: 0, rechazosAcum: 0, media: false, mediaSalta: false }]));
 
   const delBatea = (bateaId) =>
     setBateas((bs) => recalc(bs.filter((b) => b.id !== bateaId)));
+
+  // Marca/desmarca una batea como "media batea" (sirve una vez de cada dos).
+  const toggleMedia = (bateaId) =>
+    setBateas((bs) => bs.map((b) => (b.id === bateaId ? { ...b, media: !b.media, mediaSalta: false } : b)));
 
   const borrarBarco = (barcoId) => {
     setBarcos((bs) => bs.filter((b) => b.id !== barcoId));
@@ -704,7 +730,7 @@ function TabFlota({ barcos, bateas, poligonos, cierres, setBarcos, setBateas }) 
         <SectionTitle style={{ marginBottom: 0 }}>🚢 Flota</SectionTitle>
         <Btn onClick={() => setShow(!show)} color={C.blue}>+ Añadir barco</Btn>
       </div>
-      <div style={{ fontSize: 13, color: C.textMid, marginBottom: 16 }}>Barcos y sus bateas por polígono. Se crean todas las bateas en el polígono elegido; luego puedes cambiar el polígono de cada una.</div>
+      <div style={{ fontSize: 13, color: C.textMid, marginBottom: 16 }}>Barcos y sus bateas por polígono. Se crean todas las bateas en el polígono elegido; luego puedes cambiar el polígono de cada una. El botón <strong style={{ color: C.violet }}>½</strong> marca una <strong>media batea</strong>: sirve una vez y a la siguiente salta al final sin servir (alterna).</div>
 
       {show && (
         <Card style={{ maxWidth: 440, marginBottom: 20 }}>
@@ -761,6 +787,8 @@ function TabFlota({ barcos, bateas, poligonos, cierres, setBarcos, setBateas }) 
                       </Sel>
                       {enCierre && <span style={{ fontSize: 10, color: C.red, fontWeight: 700 }}>🔒 en cierre</span>}
                       {bt.viajesAcum > 0 && <span style={{ fontSize: 10, color: C.accent, fontWeight: 700 }}>★ {bt.viajesAcum}</span>}
+                      <button onClick={() => toggleMedia(bt.id)} title="Media batea: sirve una vez de cada dos vueltas"
+                        style={{ background: bt.media ? C.violet : "transparent", color: bt.media ? "#fff" : C.textDim, border: `1px solid ${bt.media ? C.violet : C.border2}`, borderRadius: 6, cursor: "pointer", fontSize: 12, fontWeight: 800, padding: "2px 8px", lineHeight: 1.4 }}>½</button>
                       {bs.length > 1 && (
                         <button onClick={() => delBatea(bt.id)} title="Eliminar batea"
                           style={{ background: "transparent", border: "none", color: C.red, cursor: "pointer", fontSize: 14, padding: "0 4px" }}>✕</button>
@@ -1275,7 +1303,7 @@ function construirFlotaImport(registros) {
     let barco = barcoMap.get(kb);
     if (!barco) { barco = { id: uid(), nombre: r.barco.trim(), pin: r.pin || "0000", activo: true }; barcoMap.set(kb, barco); barcos.push(barco); }
     else if ((!barco.pin || barco.pin === "0000") && r.pin) barco.pin = r.pin;
-    bateas.push({ id: uid(), barcoId: barco.id, poligonoId: pol.id, posicion: 0, viajesAcum: 0, rechazosAcum: 0 });
+    bateas.push({ id: uid(), barcoId: barco.id, poligonoId: pol.id, posicion: 0, viajesAcum: 0, rechazosAcum: 0, media: false, mediaSalta: false });
   }
   return { poligonos, barcos, bateas: recalc(bateas) };
 }
