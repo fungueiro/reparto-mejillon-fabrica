@@ -674,6 +674,13 @@ function TabFlota({ barcos, bateas, poligonos, cierres, setBarcos, setBateas }) 
   const [show, setShow] = useState(false);
   const [err, setErr] = useState("");
   const [confirmDel, setConfirmDel] = useState(null);
+  const [editingBarco, setEditingBarco] = useState(null); // { id, nombre }
+
+  const renombrarBarco = () => {
+    if (!editingBarco?.nombre.trim()) return;
+    setBarcos((bs) => bs.map((b) => b.id === editingBarco.id ? { ...b, nombre: editingBarco.nombre.trim() } : b));
+    setEditingBarco(null);
+  };
 
   const add = () => {
     const n = parseInt(form.nBateas);
@@ -726,6 +733,26 @@ function TabFlota({ barcos, bateas, poligonos, cierres, setBarcos, setBateas }) 
         </div>
       )}
 
+      {editingBarco && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 20 }}>
+          <Card style={{ maxWidth: 380, width: "100%", boxShadow: "0 24px 64px #000a" }}>
+            <div className="cond" style={{ fontSize: 20, fontWeight: 800, color: C.blue, marginBottom: 12 }}>✏ Renombrar barco</div>
+            <Label>Nuevo nombre</Label>
+            <Input
+              value={editingBarco.nombre}
+              onChange={(e) => setEditingBarco((x) => ({ ...x, nombre: e.target.value }))}
+              onKeyDown={(e) => { if (e.key === "Enter") renombrarBarco(); if (e.key === "Escape") setEditingBarco(null); }}
+              autoFocus
+              style={{ marginBottom: 16 }}
+            />
+            <div style={{ display: "flex", gap: 10 }}>
+              <Btn onClick={renombrarBarco} color={C.blue} style={{ flex: 1 }}>Guardar</Btn>
+              <Btn outline onClick={() => setEditingBarco(null)}>Cancelar</Btn>
+            </div>
+          </Card>
+        </div>
+      )}
+
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
         <SectionTitle style={{ marginBottom: 0 }}>🚢 Flota</SectionTitle>
         <Btn onClick={() => setShow(!show)} color={C.blue}>+ Añadir barco</Btn>
@@ -773,6 +800,7 @@ function TabFlota({ barcos, bateas, poligonos, cierres, setBarcos, setBateas }) 
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
                   <Btn small outline color={C.blue} onClick={() => addBatea(b.id, poligonos[0]?.id)}>+ Batea</Btn>
+                  <Btn small outline color={C.accent} onClick={() => setEditingBarco({ id: b.id, nombre: b.nombre })}>✏ Renombrar</Btn>
                   <Btn small outline color={C.red} onClick={() => setConfirmDel(b.id)}>Dar de baja</Btn>
                 </div>
               </div>
