@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
 import html2canvas from "html2canvas";
 import { loadAll, saveAll } from "./sync";
+import { validarOficinista, cambiarPassOficinista } from "./supabaseClient";
 
 /* ═══════════════════════════════════════════════════════════════
    REPARTO DE VIAJES · FÁBRICA · MEJILLÓN
@@ -329,16 +330,25 @@ async function descargarImagen(...args) {
 }
 
 /* ── PANTALLA DE LOGIN ─────────────────────────────────────── */
-function LoginScreen({ barcos, onLoginOficinista, onLoginPatron, oficinistaPass }) {
+function LoginScreen({ barcos, onLoginOficinista, onLoginPatron }) {
   const [modo, setModo] = useState(null);
   const [pass, setPass] = useState("");
   const [barcoId, setBarcoId] = useState("");
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
+  const [cargando, setCargando] = useState(false);
 
-  const loginOficinista = () => {
-    if (pass === oficinistaPass) { setError(""); onLoginOficinista(); }
-    else setError("Contraseña incorrecta");
+  const loginOficinista = async () => {
+    setCargando(true); setError("");
+    try {
+      const ok = await validarOficinista(pass);
+      if (ok) onLoginOficinista();
+      else setError("Contraseña incorrecta");
+    } catch (_) {
+      setError("Sin conexión con el servidor. Revisa tu internet.");
+    } finally {
+      setCargando(false);
+    }
   };
   const loginPatron = () => {
     const b = barcos.find((x) => x.id === barcoId);
@@ -379,10 +389,9 @@ function LoginScreen({ barcos, onLoginOficinista, onLoginPatron, oficinistaPass 
           <Label>Contraseña</Label>
           <Input type="password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder="••••••" style={{ marginBottom: 16 }} onKeyDown={(e) => e.key === "Enter" && loginOficinista()} />
           <div style={{ display: "flex", gap: 8 }}>
-            <Btn onClick={loginOficinista} color={C.blue} style={{ flex: 1 }}>Entrar</Btn>
+            <Btn onClick={loginOficinista} color={C.blue} style={{ flex: 1 }} disabled={cargando}>{cargando ? "Comprobando…" : "Entrar"}</Btn>
             <Btn outline onClick={() => { setModo(null); setError(""); }}>Volver</Btn>
           </div>
-          <div style={{ fontSize: 11, color: C.textDim, marginTop: 12, textAlign: "center" }}>Demo: contraseña <span className="mono">admin</span></div>
         </Card>
       )}
 
@@ -1454,24 +1463,38 @@ function ImportarFlotaCard({ onAplicar }) {
 }
 
 /* ── TAB CONFIGURACIÓN ─────────────────────────────────────── */
-function TabConfig({ barcos, setBarcos, oficinistaPass, setOficinistaPass, poligonos, setPoligonos, bateas, setBateas, setCierres, setExclusiones }) {
+function TabConfig({ barcos, setBarcos, poligonos, setPoligonos, bateas, setBateas, setCierres, setExclusiones }) {
   const aplicarImport = (registros) => {
     const { poligonos: np, barcos: nb, bateas: nbt } = construirFlotaImport(registros);
     setPoligonos(np); setBarcos(nb); setBateas(nbt);
     setCierres([]); setExclusiones([]);
   };
+  const [actualPass, setActualPass] = useState("");
   const [newPass, setNewPass] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
   const [passMsg, setPassMsg] = useState("");
+  const [guardandoPass, setGuardandoPass] = useState(false);
   const [pins, setPins] = useState(() => Object.fromEntries(barcos.map((b) => [b.id, b.pin || "0000"])));
   const [nuevoPol, setNuevoPol] = useState("");
 
-  const savePass = () => {
+  const savePass = async () => {
     if (newPass.length < 4) { setPassMsg("Mínimo 4 caracteres"); return; }
     if (newPass !== confirmPass) { setPassMsg("Las contraseñas no coinciden"); return; }
-    setOficinistaPass(newPass);
-    setNewPass(""); setConfirmPass(""); setPassMsg("✓ Contraseña actualizada");
-    setTimeout(() => setPassMsg(""), 3000);
+    setGuardandoPass(true); setPassMsg("Guardando…");
+    try {
+      const ok = await cambiarPassOficinista(actualPass, newPass);
+      if (ok) {
+        setActualPass(""); setNewPass(""); setConfirmPass("");
+        setPassMsg("✓ Contraseña actualizada");
+        setTimeout(() => setPassMsg(""), 3000);
+      } else {
+        setPassMsg("✗ La contraseña actual no es correcta");
+      }
+    } catch (_) {
+      setPassMsg("✗ Sin conexión con el servidor");
+    } finally {
+      setGuardandoPass(false);
+    }
   };
   const savePin = (barcoId) => {
     const pin = pins[barcoId] || "0000";
@@ -1498,12 +1521,14 @@ function TabConfig({ barcos, setBarcos, oficinistaPass, setOficinistaPass, polig
       <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))" }}>
         <Card>
           <div className="cond" style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 14 }}>🔑 Contraseña Oficinista</div>
+          <Label>Contraseña actual</Label>
+          <Input type="password" value={actualPass} onChange={(e) => setActualPass(e.target.value)} placeholder="Contraseña actual" style={{ marginBottom: 10 }} />
           <Label>Nueva contraseña</Label>
           <Input type="password" value={newPass} onChange={(e) => setNewPass(e.target.value)} placeholder="Nueva contraseña" style={{ marginBottom: 10 }} />
           <Label>Confirmar</Label>
           <Input type="password" value={confirmPass} onChange={(e) => setConfirmPass(e.target.value)} placeholder="Repetir contraseña" style={{ marginBottom: 14 }} onKeyDown={(e) => e.key === "Enter" && savePass()} />
           {passMsg && <div style={{ fontSize: 12, marginBottom: 10, color: passMsg.startsWith("✓") ? C.green : C.red }}>{passMsg}</div>}
-          <Btn onClick={savePass} color={C.blue} style={{ width: "100%" }}>Guardar contraseña</Btn>
+          <Btn onClick={savePass} color={C.blue} style={{ width: "100%" }} disabled={guardandoPass}>Guardar contraseña</Btn>
         </Card>
 
         <Card>
@@ -1570,7 +1595,6 @@ export default function App() {
   const [exclusiones, setExclusiones] = useState([]);
   const [historial, setHistorial] = useState([]);
   const [pedidoActivo, setPedidoActivo] = useState(null);
-  const [oficinistaPass, setOficinistaPass] = useState("admin");
   const [undoStack, setUndoStack] = useState([]); // snapshots previos a cada pedido (sesión)
   const [tab, setTab] = useState("lista");
   const [role, setRole] = useState(null);
@@ -1593,12 +1617,6 @@ export default function App() {
   useEffect(() => {
     let cancelado = false;
     (async () => {
-      // La contraseña de oficinista vive solo en local (no se sincroniza).
-      try {
-        const raw = localStorage.getItem("fabrica-state");
-        if (raw) { const s = JSON.parse(raw); if (s.oficinistaPass) setOficinistaPass(s.oficinistaPass); }
-      } catch (_) {}
-
       const remoto = await loadAll();
       if (cancelado) return;
 
@@ -1622,7 +1640,7 @@ export default function App() {
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem("fabrica-state", JSON.stringify({ poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass }));
+      localStorage.setItem("fabrica-state", JSON.stringify({ poligonos, barcos, bateas, cierres, exclusiones, historial }));
     } catch (_) {}
     if (skipSave.current) { skipSave.current = false; return; }
     if (role !== "oficinista") return;
@@ -1632,7 +1650,7 @@ export default function App() {
         .catch(() => setOffline(true));
     }, 800);
     return () => clearTimeout(t);
-  }, [poligonos, barcos, bateas, cierres, exclusiones, historial, oficinistaPass, loaded, role]);
+  }, [poligonos, barcos, bateas, cierres, exclusiones, historial, loaded, role]);
 
   /* Refresco automático para socios: recarga de Supabase cada 15 s y al volver a la pestaña. */
   useEffect(() => {
@@ -1673,7 +1691,7 @@ export default function App() {
     return (
       <>
         <GlobalStyles />
-        <LoginScreen barcos={barcos} oficinistaPass={oficinistaPass}
+        <LoginScreen barcos={barcos}
           onLoginOficinista={() => { setRole("oficinista"); setTab("lista"); }}
           onLoginPatron={(bid) => { setRole("patron"); setPatronBarcoId(bid); }} />
       </>
@@ -1742,7 +1760,7 @@ export default function App() {
           {tab === "cierres" && <TabCierres poligonos={poligonos} barcos={barcos} bateas={bateas} cierres={cierres} setCierres={setCierres} setBateas={setBateas} historial={historial} />}
           {tab === "exclusiones" && <TabExclusiones barcos={barcos} exclusiones={exclusiones} setExclusiones={setExclusiones} />}
           {tab === "historial" && <TabHistorial historial={historial} />}
-          {tab === "config" && <TabConfig barcos={barcos} setBarcos={setBarcos} oficinistaPass={oficinistaPass} setOficinistaPass={setOficinistaPass} poligonos={poligonos} setPoligonos={setPoligonos} bateas={bateas} setBateas={setBateas} setCierres={setCierres} setExclusiones={setExclusiones} />}
+          {tab === "config" && <TabConfig barcos={barcos} setBarcos={setBarcos} poligonos={poligonos} setPoligonos={setPoligonos} bateas={bateas} setBateas={setBateas} setCierres={setCierres} setExclusiones={setExclusiones} />}
         </main>
       </div>
     </>
