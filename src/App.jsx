@@ -1,8 +1,11 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
 import html2canvas from "html2canvas";
-import { loadAll, saveAll } from "./sync";
-import { validarOficinista, cambiarPassOficinista } from "./supabaseClient";
+import {
+  listarBarcos, entrarOficinista, entrarPatron, cerrarSesion,
+  cargarEstado, guardarEstado, cambiarPassOficinista, cambiarPinBarco,
+  contarBarcosSinPin,
+} from "./supabaseClient";
 
 /* ═══════════════════════════════════════════════════════════════
    REPARTO DE VIAJES · FÁBRICA · MEJILLÓN
@@ -330,19 +333,30 @@ async function descargarImagen(...args) {
 }
 
 /* ── PANTALLA DE LOGIN ─────────────────────────────────────── */
-function LoginScreen({ barcos, onLoginOficinista, onLoginPatron }) {
+function LoginScreen({ onLoginOficinista, onLoginPatron }) {
   const [modo, setModo] = useState(null);
   const [pass, setPass] = useState("");
   const [barcoId, setBarcoId] = useState("");
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
   const [cargando, setCargando] = useState(false);
+  // La lista de barcos se pide al servidor solo cuando hace falta el
+  // desplegable, y trae únicamente id y nombre: ningún PIN sale de allí.
+  const [listaBarcos, setListaBarcos] = useState(null);
+
+  useEffect(() => {
+    if (modo !== "patron" || listaBarcos) return;
+    let vivo = true;
+    listarBarcos()
+      .then((bs) => { if (vivo) setListaBarcos(bs); })
+      .catch(() => { if (vivo) { setListaBarcos([]); setError("Sin conexión con el servidor."); } });
+    return () => { vivo = false; };
+  }, [modo, listaBarcos]);
 
   const loginOficinista = async () => {
     setCargando(true); setError("");
     try {
-      const ok = await validarOficinista(pass);
-      if (ok) onLoginOficinista();
+      if (await entrarOficinista(pass)) onLoginOficinista();
       else setError("Contraseña incorrecta");
     } catch (_) {
       setError("Sin conexión con el servidor. Revisa tu internet.");
@@ -350,11 +364,19 @@ function LoginScreen({ barcos, onLoginOficinista, onLoginPatron }) {
       setCargando(false);
     }
   };
-  const loginPatron = () => {
-    const b = barcos.find((x) => x.id === barcoId);
-    if (!b) { setError("Selecciona un barco"); return; }
-    if (pin === b.pin) { setError(""); onLoginPatron(barcoId); }
-    else setError("PIN incorrecto");
+
+  const loginPatron = async () => {
+    if (!barcoId) { setError("Selecciona un barco"); return; }
+    setCargando(true); setError("");
+    try {
+      const b = await entrarPatron(barcoId, pin);
+      if (b) onLoginPatron(b.id);
+      else setError("PIN incorrecto");
+    } catch (_) {
+      setError("Sin conexión con el servidor. Revisa tu internet.");
+    } finally {
+      setCargando(false);
+    }
   };
 
   return (
@@ -400,14 +422,14 @@ function LoginScreen({ barcos, onLoginOficinista, onLoginPatron }) {
           <div className="cond" style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 16 }}>⚓ Acceso Socio / Patrón</div>
           {error && <div style={{ fontSize: 12, color: C.red, background: "#1f0808", borderRadius: 8, padding: "8px 12px", marginBottom: 12 }}>{error}</div>}
           <Label>Tu barco</Label>
-          <Sel value={barcoId} onChange={(e) => setBarcoId(e.target.value)} style={{ marginBottom: 12 }}>
-            <option value="">Seleccionar barco...</option>
-            {barcos.filter((b) => b.activo).map((b) => <option key={b.id} value={b.id}>{b.nombre}</option>)}
+          <Sel value={barcoId} onChange={(e) => setBarcoId(e.target.value)} style={{ marginBottom: 12 }} disabled={!listaBarcos}>
+            <option value="">{listaBarcos ? "Seleccionar barco..." : "Cargando barcos…"}</option>
+            {(listaBarcos || []).map((b) => <option key={b.id} value={b.id}>{b.nombre}</option>)}
           </Sel>
           <Label>PIN (4 dígitos)</Label>
           <Input type="password" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value)} placeholder="••••" style={{ marginBottom: 16 }} onKeyDown={(e) => e.key === "Enter" && loginPatron()} />
           <div style={{ display: "flex", gap: 8 }}>
-            <Btn onClick={loginPatron} color={C.accent} style={{ flex: 1, color: "#000" }}>Entrar</Btn>
+            <Btn onClick={loginPatron} color={C.accent} style={{ flex: 1, color: "#000" }} disabled={cargando}>{cargando ? "Comprobando…" : "Entrar"}</Btn>
             <Btn outline onClick={() => { setModo(null); setError(""); }}>Volver</Btn>
           </div>
         </Card>
@@ -804,7 +826,9 @@ function TabFlota({ barcos, bateas, poligonos, cierres, setBarcos, setBateas }) 
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span className="cond" style={{ fontSize: 18, fontWeight: 700, color: C.text }}>{b.nombre}</span>
-                  <span className="mono" style={{ fontSize: 11, color: C.textDim, background: C.navy, padding: "2px 8px", borderRadius: 6 }}>PIN {b.pin}</span>
+                  {b.tienePin || b.pin
+                    ? <span className="mono" style={{ fontSize: 11, color: C.textDim, background: C.navy, padding: "2px 8px", borderRadius: 6 }}>PIN ✓</span>
+                    : <span className="mono" style={{ fontSize: 11, color: C.red, background: "#1f0808", padding: "2px 8px", borderRadius: 6 }}>SIN PIN</span>}
                   <span style={{ fontSize: 11, color: C.textMid }}>{bs.length} batea(s)</span>
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
@@ -1338,8 +1362,11 @@ function construirFlotaImport(registros) {
     if (!pol) { pol = { id: uid(), nombre: r.poligono.trim() }; polMap.set(kp, pol); poligonos.push(pol); }
     const kb = normHdr(r.barco);
     let barco = barcoMap.get(kb);
-    if (!barco) { barco = { id: uid(), nombre: r.barco.trim(), pin: r.pin || "0000", activo: true }; barcoMap.set(kb, barco); barcos.push(barco); }
-    else if ((!barco.pin || barco.pin === "0000") && r.pin) barco.pin = r.pin;
+    if (!barco) {
+      barco = { id: uid(), nombre: r.barco.trim(), activo: true };
+      if (r.pin) barco.pin = r.pin;   // se cifra en el servidor al guardar
+      barcoMap.set(kb, barco); barcos.push(barco);
+    } else if (!barco.pin && r.pin) barco.pin = r.pin;
     bateas.push({ id: uid(), barcoId: barco.id, poligonoId: pol.id, posicion: 0, viajesAcum: 0, rechazosAcum: 0, media: false, mediaSalta: false });
   }
   return { poligonos, barcos, bateas: recalc(bateas) };
@@ -1474,7 +1501,17 @@ function TabConfig({ barcos, setBarcos, poligonos, setPoligonos, bateas, setBate
   const [confirmPass, setConfirmPass] = useState("");
   const [passMsg, setPassMsg] = useState("");
   const [guardandoPass, setGuardandoPass] = useState(false);
-  const [pins, setPins] = useState(() => Object.fromEntries(barcos.map((b) => [b.id, b.pin || "0000"])));
+  // Los PIN no se descargan nunca: la casilla arranca vacía y solo sirve para
+  // fijar uno nuevo. `barcosSinPin` avisa de cuántos quedan por poner.
+  const [pins, setPins] = useState({});
+  const [pinMsg, setPinMsg] = useState({});
+  const [sinPin, setSinPin] = useState(null);
+
+  useEffect(() => {
+    let vivo = true;
+    contarBarcosSinPin().then((n) => { if (vivo) setSinPin(n); }).catch(() => {});
+    return () => { vivo = false; };
+  }, [barcos]);
   const [nuevoPol, setNuevoPol] = useState("");
 
   const savePass = async () => {
@@ -1496,10 +1533,23 @@ function TabConfig({ barcos, setBarcos, poligonos, setPoligonos, bateas, setBate
       setGuardandoPass(false);
     }
   };
-  const savePin = (barcoId) => {
-    const pin = pins[barcoId] || "0000";
-    if (!/^\d{4}$/.test(pin)) { alert("El PIN debe ser exactamente 4 dígitos"); return; }
-    setBarcos((bs) => bs.map((b) => (b.id === barcoId ? { ...b, pin } : b)));
+  const savePin = async (barcoId) => {
+    const pin = pins[barcoId] || "";
+    if (!/^\d{4}$/.test(pin)) { setPinMsg((m) => ({ ...m, [barcoId]: "4 dígitos" })); return; }
+    setPinMsg((m) => ({ ...m, [barcoId]: "…" }));
+    try {
+      if (await cambiarPinBarco(barcoId, pin)) {
+        setPins((x) => ({ ...x, [barcoId]: "" }));
+        setPinMsg((m) => ({ ...m, [barcoId]: "✓" }));
+        setBarcos((bs) => bs.map((b) => (b.id === barcoId ? { ...b, tienePin: true } : b)));
+        contarBarcosSinPin().then(setSinPin).catch(() => {});
+        setTimeout(() => setPinMsg((m) => ({ ...m, [barcoId]: "" })), 2500);
+      } else {
+        setPinMsg((m) => ({ ...m, [barcoId]: "✗" }));
+      }
+    } catch (_) {
+      setPinMsg((m) => ({ ...m, [barcoId]: "sin conexión" }));
+    }
   };
   const addPol = () => {
     const n = nuevoPol.trim();
@@ -1533,17 +1583,31 @@ function TabConfig({ barcos, setBarcos, poligonos, setPoligonos, bateas, setBate
 
         <Card>
           <div className="cond" style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 14 }}>⚓ PINs de socios (4 dígitos)</div>
+          {sinPin > 0 && (
+            <div style={{ fontSize: 12, color: C.accentL, background: "#1a2f45", border: `1px solid ${C.accent}55`,
+                          borderRadius: 8, padding: "8px 12px", marginBottom: 12, lineHeight: 1.5 }}>
+              Quedan <strong>{sinPin}</strong> barco(s) sin PIN propio. Hasta que se lo pongas, esos socios no pueden entrar.
+            </div>
+          )}
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {barcos.filter((b) => b.activo).map((b) => (
               <div key={b.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <div style={{ flex: 1, fontSize: 13, color: C.text, fontWeight: 600 }}>{b.nombre}</div>
-                <input type="text" maxLength={4} value={pins[b.id] || ""}
+                <div style={{ flex: 1, fontSize: 13, color: C.text, fontWeight: 600 }}>
+                  {b.nombre}
+                  {!(b.tienePin || b.pin) && <span style={{ fontSize: 10, color: C.red, marginLeft: 6 }}>sin PIN</span>}
+                </div>
+                {pinMsg[b.id] && <span style={{ fontSize: 11, color: pinMsg[b.id] === "✓" ? C.green : C.red }}>{pinMsg[b.id]}</span>}
+                <input type="password" maxLength={4} value={pins[b.id] || ""} placeholder="····"
                   onChange={(e) => setPins((p) => ({ ...p, [b.id]: e.target.value.replace(/\D/g, "").slice(0, 4) }))}
                   className="mono"
                   style={{ width: 70, background: C.navy, border: `1px solid ${C.border2}`, color: C.text, padding: "6px 10px", borderRadius: 8, fontSize: 14, textAlign: "center", outline: "none", letterSpacing: 4 }} />
                 <Btn small onClick={() => savePin(b.id)} color={C.green}>✓</Btn>
               </div>
             ))}
+          </div>
+          <div style={{ fontSize: 11, color: C.textDim, marginTop: 12, lineHeight: 1.5 }}>
+            Los PIN se guardan cifrados en el servidor y no se pueden volver a leer, ni desde aquí ni desde la
+            base de datos. Si un socio pierde el suyo, ponle uno nuevo.
           </div>
         </Card>
 
@@ -1613,40 +1677,53 @@ export default function App() {
     setHistorial(s.historial || []);
   };
 
-  /* Carga inicial: Supabase es la fuente de la verdad; localStorage es respaldo. */
+  /* Carga: solo DESPUÉS de identificarse. Sin credencial el servidor no
+     devuelve nada, así que abrir la página ya no descarga ningún dato. */
   useEffect(() => {
+    if (!role) return;
     let cancelado = false;
     (async () => {
-      const remoto = await loadAll();
-      if (cancelado) return;
-
-      if (remoto && remoto.poligonos.length > 0) {
-        skipSave.current = true;
-        aplicarEstado(remoto);
-      } else {
-        // Supabase vacío o sin conexión: arrancamos desde la caché local si existe.
-        try {
-          const raw = localStorage.getItem("fabrica-state");
-          if (raw) { skipSave.current = true; aplicarEstado(JSON.parse(raw)); }
-        } catch (_) {}
-        if (!remoto) setOffline(true);
+      try {
+        const remoto = await cargarEstado();
+        if (cancelado) return;
+        if (remoto && (remoto.poligonos || []).length > 0) {
+          skipSave.current = true;
+          aplicarEstado(remoto);
+          setOffline(false);
+        } else if (remoto) {
+          // Base de datos vacía: se conserva lo que haya en pantalla.
+          skipSave.current = true;
+        }
+      } catch (_) {
+        if (!cancelado) setOffline(true);
+      } finally {
+        if (!cancelado) setLoaded(true);
       }
-      setLoaded(true);
     })();
     return () => { cancelado = true; };
-  }, []);
+  }, [role]);
 
-  /* Guardado: caché local siempre; Supabase solo desde la oficina (un único editor). */
+  /* Guardado: caché local siempre; Supabase solo desde la oficina (un único
+     editor). Un PIN recién tecleado (alta de barco o importación) viaja una
+     vez al servidor, que lo cifra; nunca se escribe en la caché local ni se
+     queda en memoria después de guardar. */
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem("fabrica-state", JSON.stringify({ poligonos, barcos, bateas, cierres, exclusiones, historial }));
+      const sinPines = barcos.map(({ pin, ...b }) => b);
+      localStorage.setItem("fabrica-state", JSON.stringify({ poligonos, barcos: sinPines, bateas, cierres, exclusiones, historial }));
     } catch (_) {}
     if (skipSave.current) { skipSave.current = false; return; }
     if (role !== "oficinista") return;
     const t = setTimeout(() => {
-      saveAll({ poligonos, barcos, bateas, cierres, exclusiones, historial })
-        .then(() => setOffline(false))
+      guardarEstado({ poligonos, barcos, bateas, cierres, exclusiones, historial })
+        .then(() => {
+          setOffline(false);
+          if (barcos.some((b) => b.pin)) {
+            skipSave.current = true;
+            setBarcos((bs) => bs.map(({ pin, ...b }) => b));
+          }
+        })
         .catch(() => setOffline(true));
     }, 800);
     return () => clearTimeout(t);
@@ -1657,8 +1734,10 @@ export default function App() {
     if (role !== "patron") return;
     let parar = false;
     const refrescar = async () => {
-      const r = await loadAll();
-      if (!parar && r && r.poligonos.length > 0) { skipSave.current = true; aplicarEstado(r); }
+      try {
+        const r = await cargarEstado();
+        if (!parar && r && (r.poligonos || []).length > 0) { skipSave.current = true; aplicarEstado(r); }
+      } catch (_) { /* sin conexión: se conserva lo que ya está en pantalla */ }
     };
     const iv = setInterval(refrescar, 15000);
     const onFocus = () => refrescar();
@@ -1676,6 +1755,19 @@ export default function App() {
     setUndoStack((s) => s.slice(0, -1));
   };
 
+  // El login va PRIMERO: la pantalla de carga solo tiene sentido con sesión
+  // abierta, porque sin credencial no se descarga nada.
+  if (!role) {
+    return (
+      <>
+        <GlobalStyles />
+        <LoginScreen
+          onLoginOficinista={() => { setRole("oficinista"); setTab("lista"); }}
+          onLoginPatron={(bid) => { setRole("patron"); setPatronBarcoId(bid); }} />
+      </>
+    );
+  }
+
   if (!loaded) {
     return (
       <>
@@ -1683,17 +1775,6 @@ export default function App() {
         <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", color: C.textMid }}>
           <div style={{ textAlign: "center" }}><div style={{ marginBottom: 16 }}><AnchorLogo size={64} /></div>Cargando datos...</div>
         </div>
-      </>
-    );
-  }
-
-  if (!role) {
-    return (
-      <>
-        <GlobalStyles />
-        <LoginScreen barcos={barcos}
-          onLoginOficinista={() => { setRole("oficinista"); setTab("lista"); }}
-          onLoginPatron={(bid) => { setRole("patron"); setPatronBarcoId(bid); }} />
       </>
     );
   }
@@ -1707,7 +1788,7 @@ export default function App() {
           <header style={{ background: "#0a1520", borderBottom: `1px solid ${C.border}`, padding: "0 20px", display: "flex", alignItems: "center", gap: 12, height: 52 }}>
             <AnchorLogo size={28} />
             <div className="cond" style={{ fontSize: 16, fontWeight: 800, color: C.text, flex: 1 }}>{barco?.nombre}</div>
-            <button onClick={() => { setRole(null); setPatronBarcoId(null); }}
+            <button onClick={() => { cerrarSesion(); setRole(null); setPatronBarcoId(null); setLoaded(false); }}
               style={{ background: "transparent", border: `1px solid ${C.border2}`, color: C.textMid, padding: "5px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12 }}>Cerrar sesión</button>
           </header>
           <main style={{ maxWidth: 640, margin: "0 auto", padding: "24px 20px" }}>
@@ -1738,7 +1819,7 @@ export default function App() {
               ⚠ Sin conexión — solo local
             </div>
           )}
-          <button onClick={() => setRole(null)} style={{ marginLeft: "auto", background: "transparent", border: `1px solid ${C.border2}`, color: C.textMid, padding: "5px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12 }}>Cerrar sesión</button>
+          <button onClick={() => { cerrarSesion(); setRole(null); setLoaded(false); }} style={{ marginLeft: "auto", background: "transparent", border: `1px solid ${C.border2}`, color: C.textMid, padding: "5px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12 }}>Cerrar sesión</button>
         </header>
 
         <nav className="no-print" style={{ background: "#0a1520", borderBottom: `1px solid ${C.border}`, display: "flex", overflowX: "auto", padding: "0 24px" }}>
