@@ -257,13 +257,19 @@ const AnchorLogo = ({ size = 32, op = 1 }) => (
 );
 
 /* ── EXPORTAR LISTA: HTML compartido para Imprimir/PDF e Imagen ── */
-function buildListaHTML(bateas, barcos, poligonos, cierres, exclusiones, forImage) {
+// Estilos inline de tabla: la imagen (html2canvas) pierde el <style> del <head>
+const TD = "padding:8px 10px;border-bottom:1px solid #ddd;vertical-align:middle;";
+const TH = "background:#1a3a5c;color:#fff;padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;";
+
+// `bateas` = posiciones a pintar; `todas` = lista completa (para calcular los
+// viajes que faltan aunque se pinte solo una parte); `parte` = {i, n} o null.
+function buildListaHTML(bateas, barcos, poligonos, cierres, exclusiones, forImage, todas = bateas, parte = null) {
   const filas = bateas.map((bt, i) => {
     const b = barcos.find((x) => x.id === bt.barcoId);
     const pol = poligonos.find((p) => p.id === bt.poligonoId);
     const enCierre = poligonoCerrado(bt.poligonoId, cierres);
     const excl = barcoExcluido(bt.barcoId, exclusiones);
-    const { reales, posibles } = viajesParaQueLeToque(bt, bateas, barcos, cierres, exclusiones);
+    const { reales, posibles } = viajesParaQueLeToque(bt, todas, barcos, cierres, exclusiones);
     const estado = enCierre ? "EN CIERRE" : excl ? "SIN PRODUCTO" : reales === 0 ? "¡LE TOCA!" : "En espera";
     const acum = bt.viajesAcum > 0 ? ` <small style="color:#a05a00">★ ${bt.viajesAcum} acum.</small>` : "";
     const faltanTxt = posibles !== reales
@@ -271,11 +277,11 @@ function buildListaHTML(bateas, barcos, poligonos, cierres, exclusiones, forImag
       : `${reales}`;
     const bg = excl || enCierre ? "background:#efe9f7" : i % 2 === 1 ? "background:#f5f5f5" : "";
     return `<tr style="${bg}">
-      <td style="text-align:center;font-weight:700;font-size:15px">${bt.posicion}</td>
-      <td><strong>${b?.nombre ?? "—"}</strong>${acum}</td>
-      <td>${pol?.nombre ?? "—"}</td>
-      <td style="text-align:right;font-weight:700">${faltanTxt}</td>
-      <td>${estado}</td>
+      <td style="${TD}text-align:center;font-weight:700;font-size:15px">${bt.posicion}</td>
+      <td style="${TD}"><strong>${b?.nombre ?? "—"}</strong>${acum}</td>
+      <td style="${TD}">${pol?.nombre ?? "—"}</td>
+      <td style="${TD}text-align:right;font-weight:700">${faltanTxt}</td>
+      <td style="${TD}">${estado}</td>
     </tr>`;
   }).join("");
   return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
@@ -291,9 +297,9 @@ function buildListaHTML(bateas, barcos, poligonos, cierres, exclusiones, forImag
       .leyenda { font-size:10px; color:#777; margin-top:12px; }
     </style></head><body id="cap">
     <h1>Lista de Reparto de Viajes</h1>
-    <p>Asociación de Productores de Mejillón &nbsp;·&nbsp; Fábrica &nbsp;·&nbsp; ${hoy()} &nbsp;·&nbsp; ${bateas.length} posiciones (1 batea = 1 viaje)</p>
-    <table>
-      <thead><tr><th class="c">#</th><th>Barco</th><th>Polígono</th><th class="r">Viajes para que le toque</th><th>Estado</th></tr></thead>
+    <p>Asociación de Productores de Mejillón &nbsp;·&nbsp; Fábrica &nbsp;·&nbsp; ${hoy()} &nbsp;·&nbsp; ${todas.length} posiciones (1 batea = 1 viaje)${parte ? ` &nbsp;·&nbsp; <strong>parte ${parte.i} de ${parte.n}</strong>` : ""}</p>
+    <table style="width:100%;border-collapse:collapse">
+      <thead><tr><th class="c" style="${TH}width:6%;text-align:center">#</th><th style="${TH}width:36%">Barco</th><th style="${TH}width:18%">Polígono</th><th class="r" style="${TH}width:20%;text-align:right">Viajes para que le toque</th><th style="${TH}width:20%;white-space:nowrap">Estado</th></tr></thead>
       <tbody>${filas}</tbody>
     </table>
     <div class="leyenda">Viajes para que le toque = nº de viajes que tienen que salir de las posiciones por delante. La cifra principal cuenta solo posiciones activas; (pos.) incluye polígonos cerrados y barcos sin producto por si se reactivan.</div>
@@ -307,23 +313,37 @@ function imprimirLista(...args) {
   else alert("El navegador bloqueó la ventana emergente. Permite las ventanas emergentes para imprimir/guardar PDF.");
 }
 
-async function descargarImagen(...args) {
-  const html = buildListaHTML(...args, true);
-  const cont = document.createElement("div");
-  cont.style.cssText = "position:fixed;left:-9999px;top:0;";
-  cont.innerHTML = html.replace(/<!DOCTYPE[\s\S]*?<body id="cap">/, '<div id="cap" style="width:720px;padding:24px;background:#fff;font-family:Arial,sans-serif;font-size:13px;color:#000">').replace("</body></html>", "</div>");
-  document.body.appendChild(cont);
+// Filas por imagen: WhatsApp reduce las fotos muy altas y la letra queda
+// borrosa, así que la lista se reparte en varias imágenes más bajas.
+const FILAS_POR_IMAGEN = 20;
+
+async function descargarImagen(bateas, barcos, poligonos, cierres, exclusiones) {
+  // Partes de tamaño parecido (57 filas → 19 + 19 + 19)
+  const n = Math.max(1, Math.ceil(bateas.length / FILAS_POR_IMAGEN));
+  const porParte = Math.ceil(bateas.length / n) || 1;
   try {
-    const node = cont.querySelector("#cap");
-    const canvas = await html2canvas(node, { scale: 2, backgroundColor: "#fff" });
-    const link = document.createElement("a");
-    link.download = `lista_reparto_viajes_${hoy()}.png`;
-    link.href = canvas.toDataURL("image/png");
-    link.click();
+    for (let i = 0; i < n; i++) {
+      const trozo = bateas.slice(i * porParte, (i + 1) * porParte);
+      const parte = n > 1 ? { i: i + 1, n } : null;
+      const html = buildListaHTML(trozo, barcos, poligonos, cierres, exclusiones, true, bateas, parte);
+      const cont = document.createElement("div");
+      cont.style.cssText = "position:fixed;left:-9999px;top:0;";
+      cont.innerHTML = html.replace(/<!DOCTYPE[\s\S]*?<body id="cap">/, '<div id="cap" style="width:720px;padding:24px;background:#fff;font-family:Arial,sans-serif;font-size:13px;color:#000">').replace("</body></html>", "</div>");
+      document.body.appendChild(cont);
+      try {
+        const canvas = await html2canvas(cont.querySelector("#cap"), { scale: 2, backgroundColor: "#fff" });
+        const link = document.createElement("a");
+        link.download = `lista_reparto_viajes_${hoy()}${parte ? `_parte${parte.i}de${n}` : ""}.png`;
+        link.href = canvas.toDataURL("image/png");
+        link.click();
+      } finally {
+        document.body.removeChild(cont);
+      }
+      // Pausa entre descargas para que el navegador no bloquee las siguientes
+      if (i < n - 1) await new Promise((r) => setTimeout(r, 600));
+    }
   } catch (e) {
     alert("No se pudo generar la imagen. Usa el botón Imprimir y guarda como PDF.");
-  } finally {
-    document.body.removeChild(cont);
   }
 }
 
